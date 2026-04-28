@@ -161,7 +161,6 @@ dmypy.json
 cython_debug/
 
 # 
-*.lock
 
 
 # PyCharm

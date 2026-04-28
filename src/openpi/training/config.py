@@ -1,3 +1,4 @@
+
 """See _CONFIGS for the list of available configs."""
 
 import abc
@@ -7,6 +8,14 @@ import difflib
 import logging
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
+
+# added import
+import datetime as _dt
+from openpi.shared import nnx_utils
+import openpi.policies.my_lerobot_policy as my_lerobot_policy
+import openpi.policies.piper_policy as piper_policy
+
+# end of added import
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -102,6 +111,12 @@ class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         """Create a group."""
 
+
+def _beijing_now_str() -> str:
+    tz = _dt.timezone(_dt.timedelta(hours=8))  # Beijing UTC+8
+    return _dt.datetime.now(tz).strftime("%Y%m%d_%H%M%S")
+
+# END OF ADDED CODE
 
 @dataclasses.dataclass(frozen=True)
 class ModelTransformFactory(GroupFactory):
@@ -461,6 +476,408 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+# Added code here
+import json
+import pyarrow
+import pyarrow.parquet as pq
+import os
+import numpy as np
+import pandas as pd
+
+@dataclasses.dataclass(frozen=True)
+class TransformDict(_transforms.DataTransformFn):
+    patterns: dict[str, str | None]
+
+    def __call__(self, data: _transforms.DataDict) -> _transforms.DataDict:
+        return _transforms.transform_dict(self.patterns, data)
+
+
+# ONE ARM, SO101, three view(high+base+right), padding action dim to 32     
+@dataclasses.dataclass(frozen=True)
+class LeRobotOneArmSO101ThreeViewDataConfig(DataConfigFactory):
+    repo_id: str = "doukeyidoukeyi/takeandplace_banana_run02_v21"
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        assets_dirs =  "/home/xkr/.cache/huggingface/lerobot"
+        base_cfg = self.create_base_config(assets_dirs, model_config)
+        
+        hf_home_dir = pathlib.Path.home() / ".cache/huggingface/lerobot"
+        owner, repo = self.repo_id.split("/", 1)
+        dataset_root = hf_home_dir / owner / repo
+
+        meta_dir = dataset_root / "meta"
+        stats_path = meta_dir / "stats.json"
+
+        tasks_parquet = meta_dir / "tasks.parquet"
+        tasks_jsonl = meta_dir / "tasks.jsonl"
+
+        if tasks_parquet.exists():
+            df = pq.read_table(tasks_parquet).to_pandas()
+        elif tasks_jsonl.exists():
+            df = pd.read_json(tasks_jsonl, lines=True)
+        else:
+            raise FileNotFoundError(f"Missing tasks metadata: {tasks_parquet} or {tasks_jsonl}")
+
+        # 统一字段/索引，尽量贴近 openpi 预期
+        # 你的 tasks.jsonl: {"task_index": 0, "task": "Fold the towel."}
+        if "task" in df.columns:
+            df = df.set_index("task")          # index = task string
+        elif df.index.name is None:
+            df.index.name = "task"
+
+        # ---------- tasks.parquet: prompt 在 index, task_index 在列 ----------
+        print(df.index, df["task_index"].tolist())
+        tasks_map = {int(ti): str(prompt) for prompt, ti in zip(df.index, df["task_index"])}
+
+        # ---------- stats.json -> openpi NormStats（只做 state/action） ----------
+        raw = json.loads(stats_path.read_text())
+
+        def ns(key: str) -> _normalize.NormStats:
+            e = raw[key]
+            return _normalize.NormStats(
+                mean=np.asarray(e["mean"], dtype=np.float32),
+                std=np.asarray(e["std"], dtype=np.float32),
+                q01=np.asarray(e["q01"], dtype=np.float32),
+                q99=np.asarray(e["q99"], dtype=np.float32),
+            )
+        TARGET_DIM = 32
+        ACTION_DIM = 6
+        
+        def pad_normstats(st: _normalize.NormStats, target_dim: int) -> _normalize.NormStats:
+            import numpy as np
+
+            def pad_vec(v: np.ndarray, pad_value: float) -> np.ndarray:
+                v = np.asarray(v, dtype=np.float32)
+                if v.shape[-1] == target_dim:
+                    return v
+                if v.shape[-1] > target_dim:
+                    return v[..., :target_dim]
+                pad = target_dim - v.shape[-1]
+                return np.concatenate([v, np.full((pad,), pad_value, dtype=np.float32)], axis=-1)
+
+            return _normalize.NormStats(
+                mean=pad_vec(st.mean, 0.0),
+                std=pad_vec(st.std, 1.0),   # std 补 1，避免除零/爆梯度
+                q01=pad_vec(st.q01, 0.0),
+                q99=pad_vec(st.q99, 0.0),
+            )
+                    
+        # 映射到 repack 后的 key：state / action
+        norm_stats = {
+            "state": pad_normstats(ns("observation.state"), TARGET_DIM),
+            "action": pad_normstats(ns("action"), TARGET_DIM),
+        }
+
+        repack_transform = _transforms.Group(
+        inputs=[
+            _transforms.RepackTransform(
+                {
+                    "image": {
+                        "base_0_rgb": "observation.images.base_high",
+                        "left_wrist_0_rgb": "observation.images.base_low",
+                        "right_wrist_0_rgb": "observation.images.right_wrist",
+                    },
+                    "state": "observation.state",
+                    "action": "action",
+                    "task_index": "task_index",
+
+                    # 把关心的字段保留下来
+                    "meta": {
+                        "episode_index": "episode_index",
+                        "frame_index": "frame_index",
+                        "timestamp": "timestamp",
+                        "index": "index",
+                    },
+                }
+            ),    
+            _transforms.PromptFromLeRobotTask(tasks_map),
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[my_lerobot_policy.MyLeRobotInputs(model_type=model_config.model_type, target_dim=TARGET_DIM)],
+            outputs=[my_lerobot_policy.MyLeRobotOutputs(action_dim=ACTION_DIM)],
+        )
+        
+        delta_action_mask = (
+            [True, True, True, True, True] +
+            [False]*27
+        )
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.MyDeltaActions(delta_action_mask, action_dim = 6)],
+            outputs=[_transforms.MyAbsoluteActions(delta_action_mask)],
+        )
+            
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            base_cfg,
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            norm_stats=norm_stats,
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
+        )
+
+# BiSO101, three view(high+left+right / low+left+right), padding action dim to 32     
+@dataclasses.dataclass(frozen=True)
+class LeRobotBiSO101ThreeViewDataConfig(DataConfigFactory):
+    repo_id: str = "doukeyidoukeyi/lerobot_foldthetowel_run03_v21"
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        assets_dirs =  "/home/xkr/.cache/huggingface/lerobot"
+        base_cfg = self.create_base_config(assets_dirs, model_config)
+        
+        hf_home_dir = pathlib.Path.home() / ".cache/huggingface/lerobot"
+        owner, repo = self.repo_id.split("/", 1)
+        dataset_root = hf_home_dir / owner / repo
+
+        meta_dir = dataset_root / "meta"
+        stats_path = meta_dir / "stats.json"
+
+        tasks_parquet = meta_dir / "tasks.parquet"
+        tasks_jsonl = meta_dir / "tasks.jsonl"
+
+        if tasks_parquet.exists():
+            df = pq.read_table(tasks_parquet).to_pandas()
+        elif tasks_jsonl.exists():
+            df = pd.read_json(tasks_jsonl, lines=True)
+        else:
+            raise FileNotFoundError(f"Missing tasks metadata: {tasks_parquet} or {tasks_jsonl}")
+
+        # 统一字段/索引，尽量贴近 openpi 预期
+        # 你的 tasks.jsonl: {"task_index": 0, "task": "Fold the towel."}
+        if "task" in df.columns:
+            df = df.set_index("task")          # index = task string
+        elif df.index.name is None:
+            df.index.name = "task"
+
+        # ---------- tasks.parquet: prompt 在 index, task_index 在列 ----------
+        print(df.index, df["task_index"].tolist())
+        tasks_map = {int(ti): str(prompt) for prompt, ti in zip(df.index, df["task_index"])}
+
+        # ---------- stats.json -> openpi NormStats（只做 state/action） ----------
+        raw = json.loads(stats_path.read_text())
+
+        def ns(key: str) -> _normalize.NormStats:
+            e = raw[key]
+            return _normalize.NormStats(
+                mean=np.asarray(e["mean"], dtype=np.float32),
+                std=np.asarray(e["std"], dtype=np.float32),
+                q01=np.asarray(e["q01"], dtype=np.float32),
+                q99=np.asarray(e["q99"], dtype=np.float32),
+            )
+        TARGET_DIM = 32
+        ACTION_DIM = 12
+        
+        def pad_normstats(st: _normalize.NormStats, target_dim: int) -> _normalize.NormStats:
+            import numpy as np
+
+            def pad_vec(v: np.ndarray, pad_value: float) -> np.ndarray:
+                v = np.asarray(v, dtype=np.float32)
+                if v.shape[-1] == target_dim:
+                    return v
+                if v.shape[-1] > target_dim:
+                    return v[..., :target_dim]
+                pad = target_dim - v.shape[-1]
+                return np.concatenate([v, np.full((pad,), pad_value, dtype=np.float32)], axis=-1)
+
+            return _normalize.NormStats(
+                mean=pad_vec(st.mean, 0.0),
+                std=pad_vec(st.std, 1.0),   # std 补 1，避免除零/爆梯度
+                q01=pad_vec(st.q01, 0.0),
+                q99=pad_vec(st.q99, 0.0),
+            )
+                    
+        # 映射到 repack 后的 key：state / action
+        norm_stats = {
+            "state": pad_normstats(ns("observation.state"), TARGET_DIM),
+            "action": pad_normstats(ns("action"), TARGET_DIM),
+        }
+
+        repack_transform = _transforms.Group(
+        inputs=[
+            _transforms.RepackTransform(
+                {
+                    "image": {
+                        # "base_0_rgb": "observation.images.base_high",
+                        "base_0_rgb": "observation.images.base_low",
+                        "left_wrist_0_rgb": "observation.images.left_wrist",
+                        "right_wrist_0_rgb": "observation.images.right_wrist",
+                    },
+                    "state": "observation.state",
+                    "action": "action",
+                    "task_index": "task_index",
+
+                    # 把关心的字段保留下来
+                    "meta": {
+                        "episode_index": "episode_index",
+                        "frame_index": "frame_index",
+                        "timestamp": "timestamp",
+                        "index": "index",
+                    },
+                }
+            ),    
+            _transforms.PromptFromLeRobotTask(tasks_map),
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[my_lerobot_policy.MyLeRobotInputs(model_type=model_config.model_type, target_dim=TARGET_DIM)],
+            outputs=[my_lerobot_policy.MyLeRobotOutputs(action_dim=ACTION_DIM)],
+        )
+        
+        delta_action_mask = (
+            [True, True, True, True, True] +
+            [False] +
+            [True, True, True, True, True] +
+            [False]*21
+        )
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.MyDeltaActions(delta_action_mask)],
+            outputs=[_transforms.MyAbsoluteActions(delta_action_mask)],
+        )
+            
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            base_cfg,
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            norm_stats=norm_stats,
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
+        )
+
+# PIPER, grippev view + base view, padding action dim 7 to 32     
+@dataclasses.dataclass(frozen=True)
+class PiperDataConfig(DataConfigFactory):
+    repo_id: str = "piper/piper_data_cleaned_v21"
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        assets_dirs =  "/home/xkr/.cache/huggingface/lerobot"
+        base_cfg = self.create_base_config(assets_dirs, model_config)
+        
+        hf_home_dir = pathlib.Path.home() / ".cache/huggingface/lerobot"
+        owner, repo = self.repo_id.split("/", 1)
+        dataset_root = hf_home_dir / owner / repo
+
+        meta_dir = dataset_root / "meta"
+        stats_path = meta_dir / "stats.json"
+
+        tasks_parquet = meta_dir / "tasks.parquet"
+        tasks_jsonl = meta_dir / "tasks.jsonl"
+
+        if tasks_parquet.exists():
+            df = pq.read_table(tasks_parquet).to_pandas()
+        elif tasks_jsonl.exists():
+            df = pd.read_json(tasks_jsonl, lines=True)
+        else:
+            raise FileNotFoundError(f"Missing tasks metadata: {tasks_parquet} or {tasks_jsonl}")
+
+        # 统一字段/索引，尽量贴近 openpi 预期
+        # 你的 tasks.jsonl: {"task_index": 0, "task": "Fold the towel."}
+        if "task" in df.columns:
+            df = df.set_index("task")          # index = task string
+        elif df.index.name is None:
+            df.index.name = "task"
+
+        # ---------- tasks.parquet: prompt 在 index, task_index 在列 ----------
+        print(df.index, df["task_index"].tolist())
+        tasks_map = {int(ti): str(prompt) for prompt, ti in zip(df.index, df["task_index"])}
+
+        # ---------- stats.json -> openpi NormStats（只做 state/action） ----------
+        raw = json.loads(stats_path.read_text())
+
+        def ns(key: str) -> _normalize.NormStats:
+            e = raw[key]
+            return _normalize.NormStats(
+                mean=np.asarray(e["mean"], dtype=np.float32),
+                std=np.asarray(e["std"], dtype=np.float32),
+                q01=np.asarray(e["q01"], dtype=np.float32),
+                q99=np.asarray(e["q99"], dtype=np.float32),
+            )
+        TARGET_DIM = 32
+        ACTION_DIM = 7
+        
+        def pad_normstats(st: _normalize.NormStats, target_dim: int) -> _normalize.NormStats:
+            import numpy as np
+
+            def pad_vec(v: np.ndarray, pad_value: float) -> np.ndarray:
+                v = np.asarray(v, dtype=np.float32)
+                if v.shape[-1] == target_dim:
+                    return v
+                if v.shape[-1] > target_dim:
+                    return v[..., :target_dim]
+                pad = target_dim - v.shape[-1]
+                return np.concatenate([v, np.full((pad,), pad_value, dtype=np.float32)], axis=-1)
+
+            return _normalize.NormStats(
+                mean=pad_vec(st.mean, 0.0),
+                std=pad_vec(st.std, 1.0),   # std 补 1，避免除零/爆梯度
+                q01=pad_vec(st.q01, 0.0),
+                q99=pad_vec(st.q99, 0.0),
+            )
+                    
+        # 映射到 repack 后的 key：state / action
+        norm_stats = {
+            "state": pad_normstats(ns("observation.state"), TARGET_DIM),
+            "action": pad_normstats(ns("action"), TARGET_DIM),
+        }
+
+        repack_transform = _transforms.Group(
+        inputs=[
+            _transforms.RepackTransform(
+                {
+                    "image": {
+                        "base_0_rgb": "observation.images.base",
+                        "wrist_0_rgb": "observation.images.wrist",
+                    },
+                    "state": "observation.state",
+                    "action": "action",
+                    "task_index": "task_index",
+
+                    # 把关心的字段保留下来
+                    "meta": {
+                        "episode_index": "episode_index",
+                        "frame_index": "frame_index",
+                        "timestamp": "timestamp",
+                        "index": "index",
+                    },
+                }
+            ),    
+            _transforms.PromptFromLeRobotTask(tasks_map),
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[piper_policy.PiperInputs(model_type=model_config.model_type, target_dim=TARGET_DIM)],
+            outputs=[piper_policy.PiperOutputs(action_dim=ACTION_DIM)],
+        )
+        
+        delta_action_mask = (
+            [True] * 6 +[False]*26
+        )
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.PiperDeltaActions(delta_action_mask)],
+            outputs=[_transforms.PiperAbsoluteActions(delta_action_mask)],
+        )
+            
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            base_cfg,
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            norm_stats=norm_stats,
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
+        )
+    
+# End of added code
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -501,7 +918,8 @@ class TrainConfig:
     checkpoint_base_dir: str = "./checkpoints"
 
     # Random seed that will be used by random generators during training.
-    seed: int = 42
+    seed: int = 33
+    #  secrets.randbits(32) 
     # Global batch size.
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
@@ -965,6 +1383,316 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+
+    # Added code here
+
+    #   pi05_biso101_threeview_vitfrozen_lora
+    #   Fine-tuning pi05 with LoRA on my own LeRobot dataset, with ViT frozen.
+    TrainConfig(
+        name="pi05_biso101_threeview_vitfrozen_lora",
+        exp_name=f"pi05_ft_{_beijing_now_str()}",
+        
+        model=pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,
+        action_horizon=16,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+        ),
+
+        data=LeRobotBiSO101ThreeViewDataConfig(
+            repo_id="doukeyidoukeyi/lerobot_foldthetowel_run02_v21",
+        ),
+
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+             str(pathlib.Path("~/workspace/openpi/openpi_cache/openpi-assets/checkpoints/pi05_base/params").expanduser())
+        ),
+
+        # 复用，不会写岔
+        freeze_filter = nnx.Any(
+            pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,
+                action_horizon=16,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),        # 冻结 LLM 主干（排除 LoRA）
+            nnx_utils.PathRegex(r"^PaliGemma/img/.*"),      
+        ),  
+
+        # LoRA 常用：关 EMA
+        ema_decay=None,
+
+        # 训练超参（建议先保守）
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+
+        # 先跑通建议 0
+        num_workers=2,
+
+        batch_size=8,
+        num_train_steps=30_000,
+        log_interval=50,
+        save_interval=1000,
+    ),
+    
+    #****************pi05_biso101_threeview_lora_OnDatasetV3**************BELOW***************************************
+    #   pi05_biso101_threeview_lora
+    #   Fine-tuning pi05 with LoRA on my own LeRobot dataset, action chunk size = 50
+    TrainConfig(
+        name="pi05_biso101_threeview_lora_OnDatasetV3",
+        # exp_name=f"pi05_lora_ft_{_beijing_now_str()}",
+        exp_name="pi05_lora_ft_foldtowel3-2_LowBase_DeltaAction_run04",
+        model=pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,
+        action_horizon=50,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+        ),
+
+        data=LeRobotBiSO101ThreeViewDataConfig(
+            repo_id="doukeyidoukeyi/lerobot_foldthetowel_run03_v21",
+        ),
+
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            # str(pathlib.Path("~/workspace/openpi/openpi_cache/openpi-assets/checkpoints/pi05_base/params").expanduser())
+            # str(pathlib.Path("~/workspace/openpi/checkpoints/pi05_biso101_threeview_lora_OnDatasetV3/pi05_lora_ft_V3_LowBase_DeltaAction_run01/36000/params").expanduser())
+            # str(pathlib.Path("/home/xkr/workspace/openpi/checkpoints/pi05_biso101_threeview_lora_OnDatasetV3/pi05_lora_ft_foldtowel3-2_LowBase_DeltaAction_run01/36000/params"))
+            str(pathlib.Path("/home/xkr/workspace/openpi/checkpoints/pi05_biso101_threeview_lora_OnDatasetV3/pi05_lora_ft_foldtowel3-2_LowBase_DeltaAction_run03/39999/params"))
+
+        ),
+        
+        freeze_filter = nnx.Any(
+            pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,
+                action_horizon=50,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),        # 冻结 LLM 主干（排除 LoRA）
+        ),  
+
+        # LoRA 常关 EMA
+        ema_decay = None,
+
+        # 训练超参
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-6, 
+            decay_steps=40_000, 
+            decay_lr=2e-7,      
+        ),
+        # optimizer=_optimizer.AdamW(clip_gradient_norm=2.0),
+
+        num_workers=2,
+        batch_size=8,
+        num_train_steps=40_000,
+        log_interval = 50,
+        save_interval= 4000,
+        keep_period  = 4000,
+    ),
+        
+    #*****************pi05_biso101_threeview_lora_OnDatasetV3********ABOVE***********************************
+        
+    #****************pi05_onearmso101_threeview_lora_OnDatasetV3**************BELOW***************************************
+    #   pi05_onearmso101_threeview_lora
+    #   Fine-tuning pi05 with LoRA on my own LeRobot dataset, action chunk size = 50
+    TrainConfig(
+        name="pi05_onearmso101_threeview_lora_OnDatasetV3",
+        # exp_name=f"pi05_lora_ft_{_beijing_now_str()}",
+        exp_name="pi05_lora_ft_tnpbanana02_DeltaAction_run01",
+        model=pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,
+        action_horizon=50,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+        ),
+
+        data=LeRobotOneArmSO101ThreeViewDataConfig(
+            repo_id="doukeyidoukeyi/takeandplace_banana_run02_v21",
+        ),
+
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            # str(pathlib.Path("~/workspace/openpi/openpi_cache/openpi-assets/checkpoints/pi05_base/params").expanduser())
+            # str(pathlib.Path("~/workspace/openpi/checkpoints/pi05_biso101_threeview_lora_OnDatasetV3/pi05_lora_ft_V3_LowBase_DeltaAction_run01/36000/params").expanduser())
+            # str(pathlib.Path("/home/xkr/workspace/openpi/checkpoints/pi05_biso101_threeview_lora_OnDatasetV3/pi05_lora_ft_foldtowel3-2_LowBase_DeltaAction_run01/36000/params"))
+            # str(pathlib.Path("/home/xkr/workspace/openpi/checkpoints/pi05_biso101_threeview_lora_OnDatasetV3/pi05_lora_ft_foldtowel3-2_LowBase_DeltaAction_resumeon3-1/36000/params"))
+            str(pathlib.Path("/home/xkr/workspace/openpi/checkpoints/pi05_onearmso101_threeview_lora_OnDatasetV3/pi05_lora_ft_tnpbanana1_DeltaAction_run02/14000/params"))
+
+        ),
+        
+        
+        freeze_filter = nnx.Any(
+            pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,
+                action_horizon=50,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),        # 冻结 LLM 主干（排除 LoRA）
+        ),  
+
+        # LoRA 常关 EMA
+        ema_decay = None,
+
+        # 训练超参
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5, #1e-6
+            decay_steps=30_000, #60000
+            decay_lr=5e-7,      #2e-8
+        ),
+        # optimizer=_optimizer.AdamW(clip_gradient_norm=2.0),
+
+        num_workers=2,
+        batch_size=8,
+        num_train_steps=30_000,
+        log_interval = 50,
+        save_interval= 2000,
+        keep_period  = 2000,
+    ),
+        
+    #**************pi05_onearmso101_threeview_lora_OnDatasetV3***********ABOVE***********************************
+    
+    #****************************************pi05_piper_lora**************BELOW***************************************
+    #   pi05_onearmso101_threeview_lora
+    #   Fine-tuning pi05 with LoRA on my own LeRobot dataset, action chunk size = 50
+    TrainConfig(
+        name="pi05_piper_lora",
+        # exp_name=f"pi05_lora_ft_{_beijing_now_str()}",
+        exp_name="pi05_lora_ft_piper_cleaned_Resume01_run02",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+
+        data=PiperDataConfig(
+            repo_id="piper/piper_data_cleaned_v21",
+        ),
+
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            # str(pathlib.Path("~/workspace/openpi/openpi_cache/openpi-assets/checkpoints/pi05_base/params").expanduser())
+            # str(pathlib.Path("~/workspace/openpi/checkpoints/pi05_biso101_threeview_lora_OnDatasetV3/pi05_lora_ft_V3_LowBase_DeltaAction_run01/36000/params").expanduser())
+            # str(pathlib.Path("/home/xkr/workspace/openpi/checkpoints/pi05_biso101_threeview_lora_OnDatasetV3/pi05_lora_ft_foldtowel3-2_LowBase_DeltaAction_run01/36000/params"))
+            # str(pathlib.Path("/home/xkr/workspace/openpi/checkpoints/pi05_biso101_threeview_lora_OnDatasetV3/pi05_lora_ft_foldtowel3-2_LowBase_DeltaAction_resumeon3-1/36000/params"))
+            str(pathlib.Path("/home/xkr/workspace/openpi/checkpoints/pi05_piper_lora/pi05_lora_ft_piper_cleaned_Resume01_run01/13999/params"))
+
+        ),
+        
+        
+        freeze_filter = nnx.Any(
+            pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=32,
+                action_horizon=50,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),        # 冻结 LLM 主干（排除 LoRA）
+        ),  
+
+        # LoRA 常关 EMA
+        ema_decay = None,
+
+        # 训练超参
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=700,
+            peak_lr=7e-6, #1e-6
+            decay_steps=14_000, #60000
+            decay_lr=5e-7,      #2e-8
+        ),
+        # optimizer=_optimizer.AdamW(clip_gradient_norm=2.0),
+
+        num_workers=2,
+        batch_size=16,
+        num_train_steps=14_000,
+        log_interval = 50,
+        save_interval= 2000,
+        keep_period  = 2000,
+    ),
+        
+    #*******************************************pi05_piper_lora***********ABOVE***************************
+
+        
+    #   pi0_biso101_threeview_lora_basedonALOHAtoweltask
+    #   Fine-tuning based on an expert pi0 checkpoint with LoRA.
+    #   Not tried yet.
+    TrainConfig(
+        name="pi0_biso101_threeview_lora_basedonALOHAtoweltask",
+        # exp_name=f"pi05_ft_{_beijing_now_str()}",
+        exp_name=f"pi05_ft_20260130115628",
+        
+        model=pi0_config.Pi0Config(
+        pi05=False,
+        action_dim=32,
+        action_horizon=50,
+        discrete_state_input=False,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+        ),
+
+        data=LeRobotBiSO101ThreeViewDataConfig(
+            repo_id="doukeyidoukeyi/lerobot_foldthetowel_run02_v21",
+        ),
+
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/media/wenfei/165C02105C01EAF7/openpi/openpi_cache/openpi-assets/checkpoints/pi05_aloha_towel/params"
+        ),
+
+        # 复用，不会写岔
+        freeze_filter = nnx.Any(
+            pi0_config.Pi0Config(
+                pi05=False,
+                action_dim=32,
+                action_horizon=50,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),        # 冻结 LLM 主干（排除 LoRA）
+        ),  
+
+        # LoRA 常用：关 EMA
+        ema_decay=0.99,
+
+        # 训练超参（建议先保守）
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1200,
+            peak_lr=8e-7,
+            decay_steps=40_000,
+            decay_lr=5e-8,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+
+        # 先跑通建议 0
+        num_workers=2,
+
+        batch_size=8,
+        num_train_steps=40_000,
+        log_interval=50,
+        save_interval=800,
+        keep_period = 800,
+
+    ),
+
+# End of added code
+
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

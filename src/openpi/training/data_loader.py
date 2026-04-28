@@ -458,6 +458,59 @@ class TorchDataLoader:
                     return
                 try:
                     batch = next(data_iter)
+                    # # print(batch["image"].keys())
+                    # x = batch["image"]["right_wrist_0_rgb"]  # 按你的实际 key 改
+                    # print("type:", type(x))
+                    # import matplotlib
+                    # matplotlib.use("Agg")  # 关键：无界面服务器用这个后端
+                    # import matplotlib.pyplot as plt
+
+                    # frame = x[0]  # (224,224,3)
+
+                    # # 1) 原样保存
+                    # plt.figure()
+                    # plt.title("As is")
+                    # plt.imshow(frame)
+                    # plt.axis("off")
+                    # plt.tight_layout(pad=0)
+                    # plt.savefig("as_is.png", dpi=150, bbox_inches="tight", pad_inches=0)
+                    # plt.close()
+
+                    # # 2) H<->W 交换后保存
+                    # plt.figure()
+                    # plt.title("Transposed H<->W")
+                    # plt.imshow(frame.transpose(1, 0, 2))
+                    # plt.axis("off")
+                    # plt.tight_layout(pad=0)
+                    # plt.savefig("swapped_hw.png", dpi=150, bbox_inches="tight", pad_inches=0)
+                    # plt.close()
+
+                    # print("saved: as_is.png, swapped_hw.png")
+
+                    # # torch tensor
+                    # try:
+                    #     import torch
+                    #     if torch.is_tensor(x):
+                    #         print("tensor shape:", tuple(x.shape), "dtype:", x.dtype, "device:", x.device)
+                    #         print("min/max:", x.min().item(), x.max().item())
+                    # except Exception:
+                    #     pass
+
+                    # # numpy
+                    # try:
+                    #     import numpy as np
+                    #     if isinstance(x, np.ndarray):
+                    #         print("ndarray shape:", x.shape, "dtype:", x.dtype)
+                    #         print("min/max:", x.min(), x.max())
+                    # except Exception:
+                    #     pass
+
+                    # # dict/bytes/list 等
+                    # if isinstance(x, dict):
+                    #     print("dict keys:", x.keys())
+                    # elif isinstance(x, (bytes, bytearray)):
+                    #     print("bytes len:", len(x))
+                        
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
@@ -537,4 +590,9 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            obs = _model.Observation.from_dict(batch)
+            action = batch["action"]
+            meta = batch.get("meta", {})
+            yield obs, action, meta
+
+

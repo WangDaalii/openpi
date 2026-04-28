@@ -80,6 +80,54 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
         {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
     )
 
+import numpy as np
+import flax.traverse_util as traverse_util
+import flax.nnx as nnx
+import openpi.shared.nnx_utils as nnx_utils
+
+def _flatten_pure_dict(pure: dict) -> dict[tuple[str, ...], object]:
+    # 变成 {("PaliGemma","img","...","kernel"): leaf}
+    return traverse_util.flatten_dict(pure, sep=None)
+
+def count_state_params(state: nnx.State) -> tuple[int, int]:
+    """返回 (leaf_tensors, total_elements)"""
+    flat = _flatten_pure_dict(state.to_pure_dict())
+    n_tensors = len(flat)
+    n_elems = 0
+    for _, leaf in flat.items():
+        # leaf 可能是 jax.Array 或 ShapeDtypeStruct（eval_shape 时）
+        shape = getattr(leaf, "shape", None)
+        if shape is None:
+            continue
+        n_elems += int(np.prod(shape))
+    return n_tensors, n_elems
+
+def dump_and_count_params(model: nnx.Module, freeze_filter: nnx.filterlib.Filter, limit: int = 200):
+    params = nnx.state(model)
+
+    # 只看 Param
+    all_params = params.filter(nnx.Param)
+    frozen = params.filter(nnx.All(nnx.Param, freeze_filter))
+    trainable = params.filter(nnx.All(nnx.Param, nnx.Not(freeze_filter)))
+
+    # 打印一些路径（来自 pure_dict keys）
+    flat_all = _flatten_pure_dict(all_params.to_pure_dict())
+    print("=== DEBUG: param paths (first few) ===")
+    for i, k in enumerate(flat_all.keys()):
+        if i >= limit:
+            print(f"... ({len(flat_all)} total param leaves)")
+            break
+        print("[param_path]", "/".join(k))
+
+    t_cnt, t_elems = count_state_params(trainable)
+    f_cnt, f_elems = count_state_params(frozen)
+    a_cnt, a_elems = count_state_params(all_params)
+
+    print("=== DEBUG: trainable vs frozen (by config.freeze_filter) ===")
+    print(f"[params] ALL      tensors={a_cnt}, elements={a_elems}")
+    print(f"[params] trainable tensors={t_cnt}, elements={t_elems}")
+    print(f"[params] frozen    tensors={f_cnt}, elements={f_elems}")
+
 
 @at.typecheck
 def init_train_state(
@@ -91,6 +139,13 @@ def init_train_state(
         rng, model_rng = jax.random.split(rng)
         # initialize the model (and its parameters).
         model = config.model.create(model_rng)
+
+        # ---- DEBUG: dump param paths & counts (run once) ----
+        if not getattr(init, "_did_debug_print", False):
+            init._did_debug_print = True
+            dump_and_count_params(model, config.freeze_filter)
+        # ----------------------------------------------------
+
 
         # Merge the partial params into the model.
         if partial_params is not None:
@@ -223,7 +278,8 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
     data_iter = iter(data_loader)
-    batch = next(data_iter)
+    observation, action, meta = next(data_iter)
+    batch = (observation, action)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
@@ -254,7 +310,9 @@ def main(config: _config.TrainConfig):
         total=config.num_train_steps,
         dynamic_ncols=True,
     )
-
+    
+    
+    lr_fn = config.lr_schedule.create()
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
@@ -263,11 +321,35 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            lr = float(jax.device_get(lr_fn(step)))
+            reduced_info["learning_rate"] = lr
+            info_str = ", ".join(
+                f"{k}={v:.4f}" if k != "learning_rate" else f"{k}={v:.2e}"
+                for k, v in reduced_info.items()
+            )
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
-        batch = next(data_iter)
+
+
+            # ---- NEW: print meta summary (do this only when logging) ----
+            # meta_host = jax.device_get(meta)
+
+            # if isinstance(meta_host, dict):
+            #     for k in ("episode_index", "frame_index", "index"):
+            #         if k not in meta_host:
+            #             logging.info(f"[meta] {k}: <missing>")
+            #             continue
+            #         try:
+            #             arr = np.array(meta_host[k])
+            #             head = arr.reshape(-1)[:8].tolist()
+            #             logging.info(f"[meta] {k}: shape={arr.shape} dtype={arr.dtype} head={head}")
+            #         except Exception as e:
+            #             logging.info(f"[meta] {k}: <cannot preview> err={e}")
+            # ------------------------------------------------------------
+
+        observation, action, meta = next(data_iter)
+        batch = (observation, action)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

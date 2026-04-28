@@ -221,6 +221,140 @@ class DeltaActions(DataTransformFn):
 
         return data
 
+import dataclasses
+from typing import Sequence
+
+import numpy as np
+
+@dataclasses.dataclass(frozen=True)
+class MyDeltaActions(DataTransformFn):
+    mask: Sequence[bool] | None
+    max_print: int = 5          # 最多打印几次
+    _printed: int = 0           # 内部计数器
+    action_dim: int = 12
+    
+    def __call__(self, data: DataDict) -> DataDict:
+        if "action" not in data or self.mask is None:
+            print("KEY 'action' NOT FOUND IN DATA / MASK IS NONE")
+            return data
+
+        state, action = data["state"], data["action"]
+
+        mask = np.asarray(self.mask, dtype=bool)
+        dims = int(mask.shape[-1])
+
+        # --------- 打印（变换前）---------
+        if self._printed < self.max_print:
+            b = 0  # batch里的第一条样本
+            # state: 可能是 [B, D] 或 [D]
+            st0 = np.asarray(state[b] if np.asarray(state).ndim >= 2 else state)
+            st0_12 = st0[:self.action_dim]
+
+            ac = np.asarray(action)
+            if ac.ndim == 3:
+                # action: [B, T, D]，打印第一个时间步
+                ac0 = ac[b, 0, :self.action_dim]
+            elif ac.ndim == 2:
+                # action: [B, D]
+                ac0 = ac[b, :self.action_dim]
+            else:
+                # action: [D]
+                ac0 = ac[:self.action_dim]
+
+            print("\n[MyDeltaActions] BEFORE")
+            print(" state[0][:action_dim] =", np.array2string(st0_12, precision=4, suppress_small=True))
+            print(" action[0][t0][:action_dim] =", np.array2string(ac0, precision=4, suppress_small=True))
+
+        # --------- 执行 delta 变换---------
+        # 这里假设 action 至少是 [B, T, D]；若是 [B, D] 也能广播，但 axis=-2 可能不合适
+        action[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        data["action"] = action
+
+        # --------- 打印（变换后）---------
+        if self._printed < self.max_print:
+            b = 0
+            ac2 = np.asarray(data["action"])
+            if ac2.ndim == 3:
+                ac0_after = ac2[b, 0, :self.action_dim]
+            elif ac2.ndim == 2:
+                ac0_after = ac2[b, :self.action_dim]
+            else:
+                ac0_after = ac2[:self.action_dim]
+
+            print("[MyDeltaActions] AFTER")
+            print(" action[0][t0][:action_dim] =", np.array2string(ac0_after, precision=4, suppress_small=True))
+
+            object.__setattr__(self, "_printed", self._printed + 1)
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class PiperDeltaActions(DataTransformFn):
+    mask: Sequence[bool] | None
+    max_print: int = 5          # 最多打印几次
+    _printed: int = 0           # 内部计数器
+    action_dim: int = 12
+    state_mdeg_to_rad: float = np.pi / 180000.0
+    
+    def __call__(self, data: DataDict) -> DataDict:
+        if "action" not in data or self.mask is None:
+            print("KEY 'action' NOT FOUND IN DATA / MASK IS NONE")
+            return data
+
+        state, action = data["state"], data["action"]
+        state_arr = np.asarray(state)
+        state_rad = state_arr * np.asarray(self.state_mdeg_to_rad, dtype=state_arr.dtype)
+
+        mask = np.asarray(self.mask, dtype=bool)
+        dims = int(mask.shape[-1])
+
+        # --------- 打印（变换前）---------
+        if self._printed < self.max_print:
+            b = 0  # batch里的第一条样本
+            # state: 可能是 [B, D] 或 [D]
+            st0 = np.asarray(state_rad[b] if np.asarray(state_rad).ndim >= 2 else state_rad)
+            st0_12 = st0[:self.action_dim]
+
+            ac = np.asarray(action)
+            if ac.ndim == 3:
+                # action: [B, T, D]，打印第一个时间步
+                ac0 = ac[b, 0, :self.action_dim]
+            elif ac.ndim == 2:
+                # action: [B, D]
+                ac0 = ac[b, :self.action_dim]
+            else:
+                # action: [D]
+                ac0 = ac[:self.action_dim]
+
+            print("\n[MyDeltaActions] BEFORE")
+            print(" state[0][:action_dim] =", np.array2string(st0_12, precision=4, suppress_small=True))
+            print(" action[0][t0][:action_dim] =", np.array2string(ac0, precision=4, suppress_small=True))
+
+        # --------- 执行 delta 变换---------
+        # 这里假设 action 至少是 [B, T, D]；若是 [B, D] 也能广播，但 axis=-2 可能不合适
+        action[..., :dims] -= np.expand_dims(np.where(mask, state_rad[..., :dims], 0), axis=-2)
+        data["action"] = action
+
+        # --------- 打印（变换后）---------
+        if self._printed < self.max_print:
+            b = 0
+            ac2 = np.asarray(data["action"])
+            if ac2.ndim == 3:
+                ac0_after = ac2[b, 0, :self.action_dim]
+            elif ac2.ndim == 2:
+                ac0_after = ac2[b, :self.action_dim]
+            else:
+                ac0_after = ac2[:self.action_dim]
+
+            print("[MyDeltaActions] AFTER")
+            print(" action[0][t0][:action_dim] =", np.array2string(ac0_after, precision=4, suppress_small=True))
+
+            object.__setattr__(self, "_printed", self._printed + 1)
+
+        return data
+
+
 
 @dataclasses.dataclass(frozen=True)
 class AbsoluteActions(DataTransformFn):
@@ -244,6 +378,54 @@ class AbsoluteActions(DataTransformFn):
         return data
 
 
+
+@dataclasses.dataclass(frozen=True)
+class MyAbsoluteActions(DataTransformFn):
+    """Repacks delta actions into absolute action space."""
+
+    # Boolean mask for the action dimensions to be repacked into absolute action space. Length
+    # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
+    # See `make_bool_mask` for more details.
+    mask: Sequence[bool] | None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "action" not in data or self.mask is None:
+            return data
+
+        state, action = data["state"], data["action"]
+        mask = np.asarray(self.mask)
+        dims = mask.shape[-1]
+        action[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        data["action"] = action
+
+        return data
+    
+@dataclasses.dataclass(frozen=True)
+class PiperAbsoluteActions(DataTransformFn):
+    """Repacks delta actions into absolute action space."""
+
+    # Boolean mask for the action dimensions to be repacked into absolute action space. Length
+    # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
+    # See `make_bool_mask` for more details.
+    mask: Sequence[bool] | None
+    state_mdeg_to_rad: float = np.pi / 180000.0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "action" not in data or self.mask is None:
+            return data
+
+        state, action = data["state"], data["action"]
+        state_arr = np.asarray(state)
+        state_rad = state_arr * np.asarray(self.state_mdeg_to_rad, dtype=state_arr.dtype)
+        mask = np.asarray(self.mask)
+        dims = mask.shape[-1]
+        action[..., :dims] += np.expand_dims(np.where(mask, state_rad[..., :dims], 0), axis=-2)
+        data["action"] = action
+
+        return data
+    
+    
+    
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer

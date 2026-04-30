@@ -1,26 +1,54 @@
 # Modified
-## 1 使用openpi/lerobot_replace/lerobot_dataset.py替换掉lerobot中的
-envs/openpi/lib/python3.11/site-packages/lerobot/common/datasets/lerobot_dataset.py
-(最初拉取的官方仓库不支持v3版本的lerobot dataset 于是自己魔改 
-现在的官方仓库是否支持没试过)
+
+## 1 使用 openpi/lerobot_replace/lerobot_dataset.py 替换掉 lerobot 中的
+
+`envs/openpi/lib/python3.11/site-packages/lerobot/common/datasets/lerobot_dataset.py`  
+
+> 最初拉取的官方仓库不支持 v3 版本的 lerobot dataset，于是自己魔改。  
+> 现在官方仓库是否支持没试过。
+
 ## 2 可能用到的文件
-/openpi/src/openpi/transforms.py             用于转换绝对和相对动作（注意单位变换）
-/openpi/scripts/train.py                     训练脚本，一般不用动
-/openpi/scripts/train.sh                     入口脚本，调用train.py
-/openpi/src/openpi/policies/piper_policy.py  数据预处理和后处理，如输入padding，字段检查等
-/openpi/src/openpi/training/config.py        训练设置，主要改这里
-## 3 piper训练
-.1 修改config.py
-.1.1 数据config：
-class PiperDataConfig(DataConfigFactory):repo_id: str = "piper/piper_data_cleaned_v21"...
-.1.2 原先使用lora微调，使用的训练config： 
-TrainConfig(name="pi05_piper_lora",...
-可以新增一个全参微调的config
-.2 执行openpi/scripts/train.sh开始微调
-使用lora微调时：
-fsdp-devices=1是最快的，两张卡和四张卡的速度差不多
-**注意！！！  使用--overwrite 会覆盖掉和之前TrainConfig name和exp_name相同且训练检查点，慎用**
-**续训时改成 --resume**
+
+- `/openpi/src/openpi/transforms.py`  
+  用于转换绝对和相对动作（注意单位变换）  
+- `/openpi/scripts/train.py`  
+  训练脚本，一般不用动  
+- `/openpi/scripts/train.sh`  
+  入口脚本，调用 `train.py`  
+- `/openpi/src/openpi/policies/piper_policy.py`  
+  数据预处理和后处理，如输入 padding，字段检查等  
+- `/openpi/src/openpi/training/config.py`  
+  训练设置，主要改这里  
+
+## 3 Piper 训练
+
+### 3.1 修改 `config.py`
+#### 3.1.1 数据 config
+```python
+class PiperDataConfig(DataConfigFactory):
+    repo_id: str = "piper/piper_data_cleaned_v21"
+    ...
+```
+#### 3.1.2 数据 config
+
+原先使用 LoRA 微调的训练 config：
+```python
+TrainConfig(name="pi05_piper_lora", ...)
+```
+
+可以新增一个 全参微调的 config
+
+### 3.2 执行训练
+
+运行 openpi/scripts/train.sh 开始微调。
+
+使用 LoRA 微调时：
+fsdp-devices=1 是最快的，两张卡和四张卡的速度差不多。
+
+**注意！！！**
+**使用 --overwrite 会覆盖掉与之前 TrainConfig 的 name 和 exp_name 相同的训练检查点，慎用。**
+**续训时改成 --resume。**
+
 ## 4 一些供参考的参数设置(Lora微调)
 | 参数            | 值                                                |
 |-----------------|--------------------------------------------------|

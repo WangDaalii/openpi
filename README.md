@@ -1,3 +1,41 @@
+# Modified
+## 1 使用openpi/lerobot_replace/lerobot_dataset.py替换掉lerobot中的
+envs/openpi/lib/python3.11/site-packages/lerobot/common/datasets/lerobot_dataset.py
+(最初拉取的官方仓库不支持v3版本的lerobot dataset 于是自己魔改 
+现在的官方仓库是否支持没试过)
+## 2 可能用到的文件
+/openpi/src/openpi/transforms.py             用于转换绝对和相对动作（注意单位变换）
+/openpi/scripts/train.py                     训练脚本，一般不用动
+/openpi/scripts/train.sh                     入口脚本，调用train.py
+/openpi/src/openpi/policies/piper_policy.py  数据预处理和后处理，如输入padding，字段检查等
+/openpi/src/openpi/training/config.py        训练设置，主要改这里
+## 3 piper训练
+.1 修改config.py
+.1.1 数据config：
+class PiperDataConfig(DataConfigFactory):repo_id: str = "piper/piper_data_cleaned_v21"...
+.1.2 原先使用lora微调，使用的训练config： 
+TrainConfig(name="pi05_piper_lora",...
+可以新增一个全参微调的config
+.2 执行openpi/scripts/train.sh开始微调
+使用lora微调时：
+fsdp-devices=1是最快的，两张卡和四张卡的速度差不多
+**注意！！！  使用--overwrite 会覆盖掉和之前TrainConfig name和exp_name相同且训练检查点，慎用**
+**续训时改成 --resume**
+## 4 一些供参考的参数设置(Lora微调)
+| 参数            | 值                                                |
+|-----------------|--------------------------------------------------|
+| Gemma300M Action Expert | Lora (r = 32)                                |
+| PaliGemma BackBone     | Lora (r = 16)                                |
+| Vision Encoder         | 参与训练                                      |
+| GPU                   | 2 * RTX 4090 (48G VRAM)                      |
+| peak_lr               | 1e-5~4e-5 (从 PI05 Base 检查点)  1e-6~5e-6 (继续微调) |
+| 训练步数              | 14_000~30_000 (从 PI05 Base 检查点，视任务复杂程度调整)          |
+| batch_size            | 16 (以上参数情况下)                               |
+| num_workers           | 2 (以上参数情况下)                              |
+| action_horizon        | 50（action chunk长度，建议不小于30）        |
+
+
+
 # openpi
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).

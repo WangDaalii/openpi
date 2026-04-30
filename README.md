@@ -1,7 +1,8 @@
 # Modified
 
-## 1 使用 openpi/lerobot_replace/lerobot_dataset.py 替换掉 lerobot 中的
+## 1 LEROBOT 数据集版本兼容
 
+使用 `openpi/lerobot_replace/lerobot_dataset.py` 替换掉 lerobot 中的
 `envs/openpi/lib/python3.11/site-packages/lerobot/common/datasets/lerobot_dataset.py`  
 
 > 最初拉取的官方仓库不支持 v3 版本的 lerobot dataset，于是自己魔改。  
@@ -56,7 +57,7 @@ fsdp-devices=1 是最快的，两张卡和四张卡的速度差不多。
 | PaliGemma BackBone     | Lora (r = 16)                                |
 | Vision Encoder         | 参与训练                                      |
 | GPU                   | 2 * RTX 4090 (48G VRAM)                      |
-| peak_lr               | 1e-5~4e-5 (从 PI05 Base 检查点)  1e-6~5e-6 (继续微调) |
+| peak_lr               | 1e-5\~4e-5 (从 PI05 Base 检查点)  1e-6\~5e-6 (继续微调) |
 | 训练步数              | 14_000~30_000 (从 PI05 Base 检查点，视任务复杂程度调整)          |
 | batch_size            | 16 (以上参数情况下)                               |
 | num_workers           | 2 (以上参数情况下)                              |

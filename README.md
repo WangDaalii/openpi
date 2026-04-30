@@ -2,8 +2,9 @@
 
 ## 1 LEROBOT 数据集版本兼容
 
-使用 `openpi/lerobot_replace/lerobot_dataset.py` 替换掉 lerobot 中的
+使用 `openpi/lerobot_replace/lerobot_dataset.py` 替换掉 lerobot module 中的
 `envs/openpi/lib/python3.11/site-packages/lerobot/common/datasets/lerobot_dataset.py`  
+(以conda环境为例，具体位置视lerobot依赖安装位置)
 
 > 最初拉取的官方仓库不支持 v3 版本的 lerobot dataset，于是自己魔改。  
 > 现在官方仓库是否支持没试过。
@@ -30,7 +31,7 @@ class PiperDataConfig(DataConfigFactory):
     repo_id: str = "piper/piper_data_cleaned_v21"
     ...
 ```
-#### 3.1.2 数据 config
+#### 3.1.2 训练 config
 
 原先使用 LoRA 微调的训练 config：
 ```python
@@ -47,7 +48,7 @@ TrainConfig(name="pi05_piper_lora", ...)
 fsdp-devices=1 是最快的，两张卡和四张卡的速度差不多。
 
 **注意！！！**
-**使用 --overwrite 会覆盖掉与之前 TrainConfig 的 name 和 exp_name 相同的训练检查点，慎用。**
+**使用 --overwrite 会覆盖掉之前 TrainConfig 的 name 和 exp_name 相同的训练检查点，慎用。**
 **续训时改成 --resume。**
 
 ## 4 一些供参考的参数设置(Lora微调)
